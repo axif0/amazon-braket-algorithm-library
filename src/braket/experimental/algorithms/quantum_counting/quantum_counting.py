@@ -162,12 +162,13 @@ def quantum_counting_circuit(
     Returns:
         Circuit: The complete quantum counting circuit with result types.
     """
-    counting_circ.add_circuit(
+    new_circuit = Circuit().add_circuit(counting_circ)
+    new_circuit.add_circuit(
         quantum_counting(
             counting_qubits, search_qubits, marked_states, decompose_ccnot
         )
     )
-    return counting_circ.probability(counting_qubits)
+    return new_circuit.probability(counting_qubits)
 
 
 def quantum_counting(
