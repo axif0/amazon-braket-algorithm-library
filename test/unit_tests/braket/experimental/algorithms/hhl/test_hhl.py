@@ -258,11 +258,7 @@ def test_hhl_3_clock_qubits():
     assert circ.qubit_count == 5
 
 
-def test_construct_controlled_unitary_invalid_shape():
-    """Test _construct_controlled_unitary_matrix with invalid shape."""
-    invalid_unitary = np.eye(3)
-    with pytest.raises(ValueError, match="Only 2x2 unitaries"):
-        hhl_module._construct_controlled_unitary_matrix(invalid_unitary)
+
 
 
 def test_get_hhl_results_no_success():

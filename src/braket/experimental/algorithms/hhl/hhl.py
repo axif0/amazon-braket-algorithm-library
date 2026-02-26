@@ -23,9 +23,13 @@ References:
     [2] Wikipedia: https://en.wikipedia.org/wiki/HHL_algorithm
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
+from qiskit.circuit import QuantumCircuit
+from qiskit.circuit.library import UnitaryGate
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+from qiskit_braket_provider.providers.adapter import to_braket
 
 from braket.circuits import Circuit, circuit
 from braket.circuits.qubit_set import QubitSetInput
@@ -36,11 +40,8 @@ from braket.experimental.algorithms.quantum_fourier_transform.quantum_fourier_tr
 )
 from braket.tasks import QuantumTask
 
-# =============================================================================
+
 # Public API
-# =============================================================================
-
-
 @circuit.subroutine(register=True)
 def hhl_circuit(
     matrix: np.ndarray,
@@ -247,11 +248,7 @@ def get_hhl_results(
     return aggregate_results
 
 
-# =============================================================================
 # Private helpers
-# =============================================================================
-
-
 def _validate_hermitian_2x2(matrix: np.ndarray) -> None:
     """Validate that the input is a 2x2 Hermitian matrix.
 
@@ -302,9 +299,9 @@ def _qpe_for_hhl(
         t = scaling_factor * power / (2**num_clock)
         unitary = _compute_hamiltonian_simulation(matrix, t)
 
-        # Apply controlled unitary
-        cu_matrix = _construct_controlled_unitary_matrix(unitary)
-        circ.unitary(matrix=cu_matrix, targets=[clock_qubit, input_qubit], display_name="CU")
+        # Decompose controlled unitary into 1q/2q gates and add to circuit
+        cu_circ = _decompose_controlled_unitary(unitary, [clock_qubit, input_qubit])
+        circ.add_circuit(cu_circ)
 
     # Apply inverse QFT to clock register using the library's iqft
     circ.add(iqft(clock_qubits))
@@ -331,24 +328,59 @@ def _compute_hamiltonian_simulation(matrix: np.ndarray, t: float) -> np.ndarray:
     return unitary
 
 
-def _construct_controlled_unitary_matrix(unitary: np.ndarray) -> np.ndarray:
-    """Construct the Controlled-U matrix from U for a single control and single target.
+def _decompose_controlled_unitary(
+    unitary: np.ndarray,
+    targets: List[int],
+) -> Circuit:
+    """Decompose a controlled-U gate into native 1q/2q gates via Qiskit transpilation.
+
+    Constructs a controlled-U gate from a 2x2 unitary U, then uses
+    Qiskit's transpiler to decompose it into U + CX gates, and converts the
+    result to a Braket circuit mapped onto the specified target qubits.
 
     Args:
         unitary (np.ndarray): The 2x2 unitary matrix U.
+        targets (List[int]): Target qubit indices [control, target].
 
     Returns:
-        np.ndarray: The 4x4 Controlled-U matrix.
+        Circuit: Braket circuit implementing the controlled-U with native gates.
     """
     if unitary.shape != (2, 2):
         raise ValueError("Only 2x2 unitaries supported for explicit control construction")
 
-    # CU = |0><0| ⊗ I + |1><1| ⊗ U
-    p0 = np.array([[1, 0], [0, 0]], dtype=complex)
-    p1 = np.array([[0, 0], [0, 1]], dtype=complex)
-    eye = np.eye(2, dtype=complex)
+    # Build a Qiskit circuit with the UnitaryGate controlled on 1 qubit
+    cu_gate = UnitaryGate(unitary).control(1)
+    qc = QuantumCircuit(2)
+    qc.append(cu_gate, [0, 1])
 
-    return np.kron(p0, eye) + np.kron(p1, unitary)
+    # Transpile into 1q/2q basis gates
+    pm = generate_preset_pass_manager(
+        optimization_level=2,
+        basis_gates=["cx", "u", "id", "rz", "sx", "x"],
+    )
+    transpiled = pm.run(qc)
+
+    # If transpilation optimized away all gates, return empty circuit
+    if transpiled.size() == 0:
+        return Circuit()
+
+    # Determine which original Qiskit qubits are actually used in the
+    # transpiled circuit, so we can map them to the correct target qubits.
+    active_qiskit_indices = sorted(
+        {transpiled.qubits.index(q) for instr in transpiled.data for q in instr.qubits}
+    )
+
+    # Convert transpiled Qiskit circuit to Braket circuit
+    braket_circ = to_braket(transpiled)
+
+    # Map each active Qiskit qubit index to the corresponding target qubit.
+    # Qiskit qubit 0 -> targets[0] (control), qubit 1 -> targets[1] (target).
+    # The Braket circuit's qubits are numbered 0..n-1 in the same order
+    # as the active Qiskit qubits.
+    target_mapping = [targets[i] for i in active_qiskit_indices]
+    remapped = Circuit()
+    remapped.add_circuit(braket_circ, target=target_mapping)
+    return remapped
 
 
 def _controlled_rotation(
@@ -472,8 +504,9 @@ def _inverse_qpe_for_hhl(
         # Inverse unitary: (e^{iAt})† = e^{-iAt}
         unitary_inv = _compute_hamiltonian_simulation(matrix, -t)
 
-        cu_matrix_inv = _construct_controlled_unitary_matrix(unitary_inv)
-        circ.unitary(matrix=cu_matrix_inv, targets=[clock_qubit, input_qubit], display_name="CU†")
+        # Decompose inverse controlled unitary into 1q/2q gates
+        cu_inv_circ = _decompose_controlled_unitary(unitary_inv, [clock_qubit, input_qubit])
+        circ.add_circuit(cu_inv_circ)
 
     # Apply Hadamard to clock qubits
     circ.h(clock_qubits)
