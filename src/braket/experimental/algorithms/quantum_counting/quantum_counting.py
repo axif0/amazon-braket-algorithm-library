@@ -16,7 +16,9 @@ import numpy as np
 
 from braket.circuits import Circuit
 from braket.circuits.qubit_set import QubitSetInput
+from braket.devices import Device
 from braket.experimental.algorithms.grovers_search.grovers_search import amplify, build_oracle
+from braket.tasks import QuantumTask
 
 
 def build_oracle_circuit(
@@ -66,11 +68,6 @@ def build_grover_circuit(
     Uses circuit primitives from grovers_search: build_oracle for the phase
     oracle and amplify for the diffusion operator (H · oracle_0 · H).
 
-    Note:
-        The MCZ ancilla decomposition introduces a global phase of -1
-        relative to the ideal Grover matrix.  This is accounted for
-        in get_quantum_counting_results during phase correction.
-
     Args:
         n_qubits (int): Number of qubits in the search register.
         marked_states (List[int]): Indices of marked states.
@@ -86,6 +83,164 @@ def build_grover_circuit(
     grover_circ.add_circuit(oracle_circ)
     grover_circ.add_circuit(diffusion_circ)
     return grover_circ
+
+
+def _controlled_oracle_circuit(
+    control: int,
+    search_qubits: QubitSetInput,
+    marked_states: List[int],
+    decompose_ccnot: bool = False,
+) -> Circuit:
+    """Build a controlled oracle circuit using gate-level primitives.
+
+    Makes the phase-flip oracle controlled on the given qubit by prepending
+    "1" to each marked-state bitstring, so the MCZ gate gains an extra
+    control qubit.
+
+    Args:
+        control (int): Index of the control qubit.
+        search_qubits (QubitSetInput): Indices of the search register qubits.
+        marked_states (List[int]): Indices of marked computational-basis states.
+        decompose_ccnot (bool): Whether to decompose CCNOT (Toffoli) gates.
+
+    Returns:
+        Circuit: Controlled oracle circuit.
+    """
+    n_search = len(search_qubits)
+    circ = Circuit()
+
+    for state in marked_states:
+        bitstring = format(state, f"0{n_search}b")
+        # Prepend "1" so the MCZ is controlled on the QPE qubit
+        controlled_bitstring = "1" + bitstring
+        oracle_sub = build_oracle(controlled_bitstring, decompose_ccnot)
+        # Map the oracle qubits: qubit 0 -> control, qubits 1..n -> search_qubits
+        target_mapping = [control] + list(search_qubits)
+        # The oracle may use ancilla qubits beyond n_search+1; they are
+        # automatically placed by add_circuit's target mapping.
+        all_targets = target_mapping + list(
+            range(
+                max(target_mapping) + 1,
+                max(target_mapping) + 1 + oracle_sub.qubit_count - len(target_mapping),
+            )
+        )
+        circ.add_circuit(oracle_sub, target=all_targets)
+
+    return circ
+
+
+def _controlled_diffusion_circuit(
+    control: int,
+    search_qubits: QubitSetInput,
+    decompose_ccnot: bool = False,
+) -> Circuit:
+    """Build a controlled diffusion (amplitude amplification) circuit.
+
+    The diffusion operator is D = H^⊗n · O_0 · H^⊗n, where O_0 flips the
+    phase of the |0⟩ state. To make it controlled:
+      - H gates become controlled-H (CH) gates
+      - O_0 becomes controlled by prepending "1" to the "00...0" bitstring
+
+    Args:
+        control (int): Index of the control qubit.
+        search_qubits (QubitSetInput): Indices of the search register qubits.
+        decompose_ccnot (bool): Whether to decompose CCNOT (Toffoli) gates.
+
+    Returns:
+        Circuit: Controlled diffusion circuit.
+    """
+    n_search = len(search_qubits)
+    circ = Circuit()
+
+    # First set of controlled-H gates on search qubits
+    for sq in search_qubits:
+        _add_controlled_h(circ, control, sq)
+
+    # Controlled O_0: flip phase of |0⟩, controlled on QPE qubit
+    # O_0 uses build_oracle("00...0"). Controlled version: build_oracle("1" + "00...0")
+    controlled_zero_bitstring = "1" + "0" * n_search
+    zero_oracle = build_oracle(controlled_zero_bitstring, decompose_ccnot)
+    target_mapping = [control] + list(search_qubits)
+    all_targets = target_mapping + list(
+        range(
+            max(target_mapping) + 1,
+            max(target_mapping) + 1 + zero_oracle.qubit_count - len(target_mapping),
+        )
+    )
+    circ.add_circuit(zero_oracle, target=all_targets)
+
+    # Second set of controlled-H gates on search qubits
+    for sq in search_qubits:
+        _add_controlled_h(circ, control, sq)
+
+    return circ
+
+
+def _add_controlled_h(circ: Circuit, control: int, target: int) -> None:
+    """Add a controlled-Hadamard gate to the circuit.
+
+    Decomposition: CH(c, t) = S†(t) · H(t) · T†(t) · CX(c,t) · T(t) · H(t) · S(t)
+
+    Args:
+        circ (Circuit): Circuit to append the controlled-H to.
+        control (int): Control qubit index.
+        target (int): Target qubit index.
+    """
+    circ.s(target)
+    circ.h(target)
+    circ.t(target)
+    circ.cnot(control, target)
+    circ.ti(target)
+    circ.h(target)
+    circ.si(target)
+
+
+def controlled_grover_circuit(
+    control: int,
+    search_qubits: QubitSetInput,
+    marked_states: List[int],
+    power: int = 1,
+    decompose_ccnot: bool = False,
+) -> Circuit:
+    """Build a controlled Grover operator G^power as a gate-level circuit.
+
+    Constructs the controlled Grover operator C-G = C-D · C-O entirely from
+    gate-level primitives:
+      - The oracle is made controlled by prepending "1" to each marked-state
+        bitstring, adding the control qubit as an extra MCZ control.
+      - The diffusion operator is made controlled by using controlled-H (CH)
+        gates and a controlled zero-oracle.
+
+    Note:
+        The MCZ ancilla decomposition introduces a global phase of -1 on
+        the Grover operator. This phase is inherent in the circuit-based
+        controlled construction and is corrected during post-processing
+        in get_quantum_counting_results.
+
+    Args:
+        control (int): Index of the QPE control qubit.
+        search_qubits (QubitSetInput): Indices of the search register qubits.
+        marked_states (List[int]): Indices of marked computational-basis states.
+        power (int): Number of times to apply the Grover operator (default 1).
+        decompose_ccnot (bool): Whether to decompose CCNOT (Toffoli) gates.
+
+    Returns:
+        Circuit: Circuit implementing the controlled G^power operator.
+    """
+    circ = Circuit()
+
+    for _ in range(power):
+        # Controlled oracle
+        circ.add_circuit(
+            _controlled_oracle_circuit(control, search_qubits, marked_states, decompose_ccnot)
+        )
+
+        # Controlled diffusion
+        circ.add_circuit(
+            _controlled_diffusion_circuit(control, search_qubits, decompose_ccnot)
+        )
+
+    return circ
 
 
 def inverse_qft_for_counting(qubits: QubitSetInput) -> Circuit:
@@ -114,32 +269,6 @@ def inverse_qft_for_counting(qubits: QubitSetInput) -> Circuit:
     return qft_circ
 
 
-def controlled_grover(
-    control: int, target_qubits: QubitSetInput, grover_unitary: np.ndarray
-) -> Circuit:
-    """Apply a controlled Grover operator.
-
-    Applies the controlled-U gate where U is the Grover operator, with the
-    given control qubit and target qubits.
-
-    Args:
-        control (int): Index of the control qubit.
-        target_qubits (QubitSetInput): Indices of target (search and ancilla) qubits.
-     """
-    circ = Circuit()
-
-    # Build controlled unitary: |0><0| ⊗ I + |1><1| ⊗ U
-    p0 = np.array([[1.0, 0.0], [0.0, 0.0]])
-    p1 = np.array([[0.0, 0.0], [0.0, 1.0]])
-    id_matrix = np.eye(len(grover_unitary))
-    controlled_matrix = np.kron(p0, id_matrix) + np.kron(p1, grover_unitary)
-
-    targets = [control] + list(target_qubits)
-    circ.unitary(matrix=controlled_matrix, targets=targets)
-
-    return circ
-
-
 def quantum_counting_circuit(
     counting_circ: Circuit,
     counting_qubits: QubitSetInput,
@@ -149,8 +278,8 @@ def quantum_counting_circuit(
 ) -> Circuit:
     """Create the full quantum counting circuit with result types.
 
-    Builds the Grover operator as a circuit from grovers_search primitives
-    (build_oracle + amplify), extracts its unitary, and applies QPE.
+    Builds the controlled Grover operator as a gate-level circuit and
+    applies QPE.
 
     Args:
         counting_circ (Circuit): Initial circuit (may contain setup operations).
@@ -179,20 +308,18 @@ def quantum_counting(
 ) -> Circuit:
     """Build the core quantum counting circuit using QPE on the Grover operator.
 
-    Constructs the Grover operator as a gate-level circuit from grovers_search
-    primitives (build_oracle for the phase oracle, amplify for the diffusion
-    operator), extracts its unitary via Circuit.to_unitary(), and applies
-    controlled-G^(2^k) for QPE.
+    Constructs the controlled Grover operator as a gate-level circuit from
+    grovers_search primitives (build_oracle for the phase oracle and
+    controlled-H gates for the diffusion operator).
 
     Note:
         The MCZ ancilla decomposition in grovers_search introduces a global
         phase of -1 on the Grover operator relative to the ideal matrix.
-        This shifts QPE phase estimates by 0.5. The correction is applied
-        in get_quantum_counting_results.
+        This phase shift is corrected in get_quantum_counting_results.
 
     The circuit structure:
       1. Apply H to all counting qubits
-      2. Apply H to all search qubits (prepare uniform superposition |s>)
+      2. Apply H to all search qubits (prepare uniform superposition |s⟩)
       3. Apply controlled-G^(2^k) for each counting qubit k
       4. Apply inverse QFT to counting qubits
 
@@ -205,39 +332,46 @@ def quantum_counting(
     Returns:
         Circuit: Circuit implementing the quantum counting algorithm.
     """
-    n_search = len(search_qubits)
-
-    # Build the Grover operator circuit from grovers_search primitives
-    grover_circ = build_grover_circuit(n_search, marked_states, decompose_ccnot)
-    grover_unitary = grover_circ.to_unitary()
-
-    # Determine ancilla qubits introduced by the circuit decomposition
-    n_ancilla = grover_circ.qubit_count - n_search
-    ancilla_qubits = [
-        max(list(counting_qubits) + list(search_qubits)) + 1 + i
-        for i in range(n_ancilla)
-    ]
-    all_grover_qubits = list(search_qubits) + ancilla_qubits
-
     qc_circ = Circuit()
 
     # Hadamard on counting qubits
     qc_circ.h(counting_qubits)
 
-    # Hadamard on search qubits (prepare |s>)
+    # Hadamard on search qubits (prepare |s⟩)
     qc_circ.h(search_qubits)
 
     # Controlled-G^(2^k)
     for ii, qubit in enumerate(reversed(counting_qubits)):
         power = 2**ii
-        g_power = np.linalg.matrix_power(grover_unitary, power)
-        qc_circ.add_circuit(controlled_grover(qubit, all_grover_qubits, g_power))
+        qc_circ.add_circuit(
+            controlled_grover_circuit(
+                qubit, search_qubits, marked_states, power, decompose_ccnot
+            )
+        )
 
     # Inverse QFT on counting qubits
     qc_circ.add_circuit(inverse_qft_for_counting(counting_qubits))
 
     return qc_circ
 
+
+def run_quantum_counting(
+    circuit: Circuit,
+    device: Device,
+    shots: int = 1000,
+) -> QuantumTask:
+    """Run the quantum counting circuit on a device.
+
+    Args:
+        circuit (Circuit): The quantum counting circuit to run.
+        device (Device): Braket device backend.
+        shots (int): Number of measurement shots (default is 1000).
+
+    Returns:
+        QuantumTask: Task from running quantum counting.
+    """
+    task = device.run(circuit, shots=shots)
+    return task
 
 
 def get_quantum_counting_results(

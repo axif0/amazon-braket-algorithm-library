@@ -11,17 +11,15 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 
-import numpy as np
 from unittest.mock import MagicMock
+
+import numpy as np
+
 from braket.circuits import Circuit
 from braket.devices import LocalSimulator
-
 from braket.experimental.algorithms.quantum_counting import quantum_counting as qc
 
-
-# ============================================================
 # Oracle / circuit construction tests
-# ============================================================
 
 
 def test_oracle_circuit_single_marked():
@@ -59,9 +57,7 @@ def test_grover_circuit_unitarity():
     np.testing.assert_array_almost_equal(product, np.eye(len(u)), decimal=10)
 
 
-# ============================================================
 # Circuit construction tests
-# ============================================================
 
 
 def test_quantum_counting_circuit_construction():
@@ -86,9 +82,7 @@ def test_inverse_qft_for_counting_2_qubits():
     assert len(qft_circ.instructions) == 4
 
 
-# ============================================================
 # End-to-end counting tests
-# ============================================================
 
 
 def _expected_M(n_counting: int, M_true: int, N: int) -> float:
@@ -261,17 +255,6 @@ def test_count_with_marked_initial_state():
     N = 2 ** len(search_qubits)
     M_exp = _expected_M(len(counting_qubits), len(marked_states), N)
 
-    # Build the Grover circuit and extract its unitary
-    grover_circ = qc.build_grover_circuit(len(search_qubits), marked_states)
-    grover_unitary = grover_circ.to_unitary()
-
-    # Determine ancilla qubits from circuit decomposition
-    n_ancilla = grover_circ.qubit_count - len(search_qubits)
-    ancilla_qubits = [
-        max(counting_qubits + search_qubits) + 1 + i for i in range(n_ancilla)
-    ]
-    all_grover_qubits = list(search_qubits) + ancilla_qubits
-
     # Build custom QPE circuit with marked-state initialization
     circ = Circuit()
 
@@ -281,11 +264,12 @@ def test_count_with_marked_initial_state():
     # Prepare |β⟩ = |11⟩ (marked state) instead of uniform superposition
     circ.x(search_qubits)
 
-    # Controlled-G^(2^k) for QPE
+    # Controlled-G^(2^k) using gate-level circuit
     for ii, qubit in enumerate(reversed(counting_qubits)):
         power = 2 ** ii
-        g_power = np.linalg.matrix_power(grover_unitary, power)
-        circ.add_circuit(qc.controlled_grover(qubit, all_grover_qubits, g_power))
+        circ.add_circuit(
+            qc.controlled_grover_circuit(qubit, search_qubits, marked_states, power)
+        )
 
     # Inverse QFT on counting qubits
     circ.add_circuit(qc.inverse_qft_for_counting(counting_qubits))
@@ -355,3 +339,42 @@ def test_get_quantum_counting_results_empty_counts():
     assert count_estimates["phases"] == []
     assert count_estimates["estimated_counts"] == []
     assert count_estimates["best_estimate"] is None
+
+
+def test_run_quantum_counting():
+    """run_quantum_counting should run the circuit and return a task."""
+    counting_qubits = [0, 1, 2]
+    search_qubits = [3]
+    marked_states = [0]
+
+    circ = Circuit()
+    circ = qc.quantum_counting_circuit(circ, counting_qubits, search_qubits, marked_states)
+
+    device = LocalSimulator()
+    task = qc.run_quantum_counting(circ, device, shots=100)
+
+    count_estimates = qc.get_quantum_counting_results(task, counting_qubits, search_qubits)
+
+    assert count_estimates["best_estimate"] is not None
+    assert count_estimates["search_space_size"] == 2
+
+
+def test_controlled_grover_circuit_construction():
+    """Controlled Grover circuit should produce a non-empty circuit."""
+    control = 0
+    search_qubits = [1, 2]
+    marked_states = [1]
+
+    circ = qc.controlled_grover_circuit(control, search_qubits, marked_states)
+    assert len(circ.instructions) > 0
+
+
+def test_controlled_grover_circuit_power():
+    """Controlled Grover circuit with power > 1 should have more gates."""
+    control = 0
+    search_qubits = [1, 2]
+    marked_states = [1]
+
+    circ_p1 = qc.controlled_grover_circuit(control, search_qubits, marked_states, power=1)
+    circ_p2 = qc.controlled_grover_circuit(control, search_qubits, marked_states, power=2)
+    assert len(circ_p2.instructions) > len(circ_p1.instructions)

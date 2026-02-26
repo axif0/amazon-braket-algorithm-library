@@ -16,4 +16,5 @@ from braket.experimental.algorithms.quantum_counting.quantum_counting import (  
     build_oracle_circuit,
     get_quantum_counting_results,
     quantum_counting_circuit,
+    run_quantum_counting,
 )
