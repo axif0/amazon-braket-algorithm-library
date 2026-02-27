@@ -173,6 +173,10 @@ def _controlled_diffusion_circuit(
     for sq in search_qubits:
         _add_controlled_h(circ, control, sq)
 
+    # Apply Z gate to correct the -1 global phase difference between
+    # I - 2|s><s| and 2|s><s| - I when controlled.
+    circ.z(control)
+
     return circ
 
 
@@ -209,13 +213,8 @@ def controlled_grover_circuit(
       - The oracle is made controlled by prepending "1" to each marked-state
         bitstring, adding the control qubit as an extra MCZ control.
       - The diffusion operator is made controlled by using controlled-H (CH)
-        gates and a controlled zero-oracle.
-
-    Note:
-        The MCZ ancilla decomposition introduces a global phase of -1 on
-        the Grover operator. This phase is inherent in the circuit-based
-        controlled construction and is corrected during post-processing
-        in get_quantum_counting_results.
+        gates, a controlled zero-oracle, and a Z gate on the control qubit
+        to correct the inherent -1 global phase of the diffusion operator.
 
     Args:
         control (int): Index of the QPE control qubit.
@@ -311,11 +310,6 @@ def quantum_counting(
     Constructs the controlled Grover operator as a gate-level circuit from
     grovers_search primitives (build_oracle for the phase oracle and
     controlled-H gates for the diffusion operator).
-
-    Note:
-        The MCZ ancilla decomposition in grovers_search introduces a global
-        phase of -1 on the Grover operator relative to the ideal matrix.
-        This phase shift is corrected in get_quantum_counting_results.
 
     The circuit structure:
       1. Apply H to all counting qubits
@@ -418,9 +412,6 @@ def get_quantum_counting_results(
             )
 
     # Convert counting register bitstrings to phase estimates and M estimates
-    # The MCZ ancilla decomposition introduces a global phase of -1 on the
-    # Grover operator, shifting QPE phase estimates by 0.5. We correct by
-    # computing: corrected_phase = |raw_phase - 0.5|
     phases, estimated_counts = _get_counting_estimates(counting_register_results, n_counting, N)
 
     # Best estimate from most frequent outcome
@@ -428,7 +419,7 @@ def get_quantum_counting_results(
         best_key = max(counting_register_results, key=counting_register_results.get)
         best_y = int(best_key, 2)
         raw_phase = best_y / (2**n_counting)
-        best_phase = abs(raw_phase - 0.5)
+        best_phase = raw_phase
         best_M = N * (np.sin(np.pi * best_phase) ** 2)
     else:
         best_key = None
@@ -452,7 +443,7 @@ def get_quantum_counting_results(
         for bitstring, count in sorted_cr[:6]:
             y_val = int(bitstring, 2)
             raw_ph = y_val / (2**n_counting)
-            ph = abs(raw_ph - 0.5)
+            ph = raw_ph
             m_est = N * (np.sin(np.pi * ph) ** 2)
             print(f"  |{bitstring}>: {count} counts  ->  phase = {ph:.4f},  M ~ {m_est:.4f}")
         if len(sorted_cr) > 6:
@@ -484,8 +475,7 @@ def _get_counting_estimates(
     for bitstring in counting_register_results:
         y = int(bitstring, 2)
         raw_phase = y / (2**n_counting)
-        # Correct for -1 global phase from MCZ decomposition
-        phase = abs(raw_phase - 0.5)
+        phase = raw_phase
         M_est = N * (np.sin(np.pi * phase) ** 2)
         phases.append(phase)
         estimated_counts.append(M_est)
