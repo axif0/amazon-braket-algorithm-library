@@ -1,16 +1,17 @@
-import pytest
-import networkx as nx
 import unittest
+from unittest.mock import patch
+
+import networkx as nx
+import pytest
 
 from braket.experimental.algorithms.adaptive_shot_allocation.adaptive_allocator import (
+    AdaptiveShotAllocator,
     commute,
-    qwc_commute,
     gen_commute,
+    qwc_commute,
     term_variance_estimate,
     terms_covariance_estimate,
-    AdaptiveShotAllocator,
 )
-from unittest.mock import patch
 
 # Fixtures for common test setups
 
