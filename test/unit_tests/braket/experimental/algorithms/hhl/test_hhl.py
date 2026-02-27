@@ -258,9 +258,6 @@ def test_hhl_3_clock_qubits():
     assert circ.qubit_count == 5
 
 
-
-
-
 def test_get_hhl_results_no_success():
     """Test get_hhl_results when no shots succeed (no post-selection)."""
     matrix = np.array([[1, 0], [0, 2]], dtype=complex)
@@ -350,7 +347,6 @@ def test_post_selected_counts_accumulation():
 
 def test_controlled_rotation_zeros():
     """Test controlled rotation with zero eigenvalues."""
-    circ = Circuit()
     # If eigenvalues are all "zero" (filtered by 1e-10)
     eigenvalues = np.array([0.0, 1e-11], dtype=float)
 
@@ -385,3 +381,17 @@ def test_hhl_small_ratio_skip():
     # for the max eigenvalue component (reconstructed ~ 1e8, c ~ 1e-8)
     circ = hhl_module.hhl_circuit(matrix, b_vector, num_clock_qubits=2)
     assert circ is not None
+
+
+def test_decompose_controlled_unitary_wrong_shape():
+    """Test that a non-2x2 unitary raises ValueError in decompose function."""
+    unitary = np.eye(4, dtype=complex)
+    with pytest.raises(ValueError, match="Only 2x2 unitaries"):
+        hhl_module._decompose_controlled_unitary(unitary, [0, 1])
+
+
+def test_decompose_controlled_unitary_empty():
+    """Test decompose_controlled_unitary with an identity unitary (results in 0 gates)."""
+    unitary = np.eye(2, dtype=complex)
+    circ = hhl_module._decompose_controlled_unitary(unitary, [0, 1])
+    assert len(circ.instructions) == 0
